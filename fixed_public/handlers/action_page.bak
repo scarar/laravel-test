@@ -1,0 +1,92 @@
+<?php
+/**
+ * File: action_page.php
+ * Purpose: Newsletter form handler with TOR verification
+ */
+session_start();
+$pageTitle = 'Newsletter Signup';
+include '../includes/header.php';
+include '../includes/tor_challenge.php';
+//include '../includes/force_tor_challenge.php';
+// Initialize messages
+$errorMessage = '';
+$successMessage = '';
+
+function handleError($message) {
+    global $errorMessage;
+    $errorMessage = $message;
+}
+
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    $torChallenge = new TORChallengeHandler();
+    $userIP = $_SERVER['REMOTE_ADDR'];
+
+    // Handle TOR users
+    if ($torChallenge->isTorUser($userIP)) {
+        if (!isset($_POST['tor_answer'])) {
+            echo '<section id="mainBody" class="fade-in">';
+            echo $torChallenge->renderChallengeForm($_POST);
+            echo '</section>';
+//            include '../includes/footer.php';
+            exit;
+        } 
+        
+        if (!$torChallenge->validateAnswer($_POST['tor_answer'])) {
+            echo '<section id="mainBody" class="fade-in">';
+            echo "<div class='message-container'><p class='error-message'>Incorrect answer. Please try again.</p></div>";
+            echo $torChallenge->renderChallengeForm($_POST);
+            echo '</section>';
+//            include '../includes/footer.php';
+            exit;
+        }
+    }
+
+    // Process form submission
+    $name = htmlspecialchars($_POST["Name"] ?? '', ENT_QUOTES, 'UTF-8');
+    $email = filter_var($_POST["Email"] ?? '', FILTER_SANITIZE_EMAIL);
+
+    if (empty($name) || strlen($name) > 100) {
+        handleError("Please provide a valid name (maximum 100 characters).");
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        handleError("Please provide a valid email address.");
+    } else {
+        $config = require '../includes/config.php';
+        $filePath = $config['paths']['data'] . '/newsletter.txt';
+        $dateTime = date("Y-m-d H:i:s");
+        $data = sprintf(
+            "Date: %s, Name: %s, Email: %s, IP: %s, TOR: %s\n",
+            $dateTime,
+            $name,
+            $email,
+            $userIP,
+            $torChallenge->isTorUser($userIP) ? "Yes" : "No"
+        );
+
+        if (file_put_contents($filePath, $data, FILE_APPEND | LOCK_EX)) {
+            $successMessage = "Thank you, " . htmlspecialchars($name) . ". You've been successfully subscribed!";
+        } else {
+            handleError("Sorry, there was an error processing your subscription.");
+        }
+    }
+}
+?>
+
+<section id="mainBody" class="fade-in">
+    <div class="message-container">
+        <?php if ($errorMessage): ?>
+            <div class="error-message">
+                <p><?php echo htmlspecialchars($errorMessage); ?></p>
+                <p><a href="javascript:history.back()" class="back-link">Go Back</a></p>
+            </div>
+        <?php endif; ?>
+        
+        <?php if ($successMessage): ?>
+            <div class="success-message">
+                <p><?php echo htmlspecialchars($successMessage); ?></p>
+                <p><a href="/" class="home-link">Return to Home</a></p>
+            </div>
+        <?php endif; ?>
+    </div>
+</section>
+
+<?php include '../includes/footer.php'; ?>

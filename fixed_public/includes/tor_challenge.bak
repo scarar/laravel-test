@@ -1,0 +1,220 @@
+<?php
+/**
+ * File: tor_challenge.php
+ * Purpose: TOR detection and math CAPTCHA system
+ */
+class TORChallengeHandler {
+    private $session;
+    private $formData;
+    private const MAX_ATTEMPTS = 3;
+    private const CHALLENGE_TIMEOUT = 300;
+    private $torExitNodes = [];
+    
+    // Multiple TOR exit node list URLs for fallback
+    private $torExitListUrls = [
+        'https://check.torproject.org/exit-addresses',
+        'https://aus1.torproject.org/tordnsel/exit-addresses',
+        'https://tor.void.gr/exit-addresses'
+    ];
+
+    public function __construct() {
+        if (session_status() === PHP_SESSION_NONE) {
+            session_start();
+        }
+        
+        $this->initializeSession();
+        $this->loadTorExitNodes();
+    }
+    
+    private function initializeSession() {
+        if (!isset($_SESSION['tor_challenge_attempts'])) {
+            $_SESSION['tor_challenge_attempts'] = 0;
+        }
+        
+        if (!isset($_SESSION['tor_challenge_timestamp'])) {
+            $_SESSION['tor_challenge_timestamp'] = time();
+        }
+    }
+    
+    private function loadTorExitNodes() {
+        $cacheFile = __DIR__ . '/../cache/tor_exit_nodes.cache';
+        $cacheExpiry = 3600; // 1 hour
+
+        if (!is_dir(dirname($cacheFile))) {
+            mkdir(dirname($cacheFile), 0755, true);
+        }
+        
+        if ($this->isValidCache($cacheFile, $cacheExpiry)) {
+            $this->torExitNodes = file($cacheFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            return;
+        }
+        
+        foreach ($this->torExitListUrls as $url) {
+            if ($this->fetchTorExitList($url, $cacheFile)) {
+                break;
+            }
+        }
+        
+        if (empty($this->torExitNodes) && file_exists($cacheFile)) {
+            $this->torExitNodes = file($cacheFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            error_log("TOR Challenge: Using expired cache due to fetch failures");
+        }
+    }
+    
+    private function isValidCache($cacheFile, $cacheExpiry) {
+        return file_exists($cacheFile) && 
+               (time() - filemtime($cacheFile) < $cacheExpiry) &&
+               filesize($cacheFile) > 0;
+    }
+    
+    private function fetchTorExitList($url, $cacheFile) {
+        try {
+            $context = stream_context_create([
+                'http' => [
+                    'timeout' => 5,
+                    'ignore_errors' => true,
+                    'user_agent' => 'TOR Challenge Verification/1.0'
+                ]
+            ]);
+            
+            $torExitList = @file_get_contents($url, false, $context);
+            
+            if ($torExitList !== false) {
+                preg_match_all('/ExitAddress\s+(\d+\.\d+\.\d+\.\d+)/', $torExitList, $matches);
+                if (!empty($matches[1])) {
+                    $this->torExitNodes = array_unique($matches[1]);
+                    file_put_contents($cacheFile, implode("\n", $this->torExitNodes));
+                    error_log("TOR Challenge: Successfully updated exit node list from $url");
+                    return true;
+                }
+            }
+        } catch (Exception $e) {
+            error_log("TOR Challenge Error fetching from $url: " . $e->getMessage());
+        }
+        return false;
+    }
+
+    public function isTorUser($ip) {
+        // Check cached list
+        if (in_array($ip, $this->torExitNodes)) {
+            return true;
+        }
+        
+        // Check TOR headers
+        $torHeaders = [
+            'HTTP_X_TOR',
+            'HTTP_X_FORWARDED_FOR_TOR',
+            'HTTP_TOR_EXIT',
+            'HTTP_TOR'
+        ];
+        
+        foreach ($torHeaders as $header) {
+            if (isset($_SERVER[$header])) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    public function generateChallenge() {
+        $num1 = rand(1, 20);
+        $num2 = rand(1, 20);
+        $operations = ['+', '-', '*'];
+        $operation = $operations[array_rand($operations)];
+        
+        $question = "$num1 $operation $num2";
+        $answer = eval("return $question;");
+        
+        $_SESSION['tor_challenge'] = [
+            'question' => $question,
+            'answer' => $answer,
+            'timestamp' => time()
+        ];
+        
+        return $question;
+    }
+    
+    public function validateAnswer($userAnswer) {
+        if (!isset($_SESSION['tor_challenge']['answer'])) {
+            return false;
+        }
+        
+        if (time() - $_SESSION['tor_challenge_timestamp'] > self::CHALLENGE_TIMEOUT) {
+            unset($_SESSION['tor_challenge']);
+            return false;
+        }
+        
+        $_SESSION['tor_challenge_attempts']++;
+        
+        if ($_SESSION['tor_challenge_attempts'] > self::MAX_ATTEMPTS) {
+            unset($_SESSION['tor_challenge']);
+            $_SESSION['tor_challenge_attempts'] = 0;
+            return false;
+        }
+        
+        $isCorrect = intval($userAnswer) === $_SESSION['tor_challenge']['answer'];
+        
+        if ($isCorrect) {
+            $_SESSION['tor_challenge_attempts'] = 0;
+            unset($_SESSION['tor_challenge']);
+        }
+        
+        return $isCorrect;
+    }
+    
+    public function renderChallengeForm($formData = []) {
+        $this->formData = $formData;
+        $question = $this->generateChallenge();
+        
+        ob_start();
+        ?>
+        <div class="tor-challenge-container">
+            <h2>Security Verification Required</h2>
+            <p>You are accessing this site through TOR. Please solve this math problem to continue:</p>
+            
+            <?php if ($_SESSION['tor_challenge_attempts'] > 0): ?>
+                <div class="challenge-attempts">
+                    Attempts remaining: <?php echo self::MAX_ATTEMPTS - $_SESSION['tor_challenge_attempts']; ?>
+                </div>
+            <?php endif; ?>
+            
+            <form method="post" action="" class="tor-challenge-form">
+                <label for="math-answer" class="challenge-question">
+                    <?php echo htmlspecialchars($question); ?> = ?
+                </label>
+                
+                <input type="number" 
+                       id="math-answer"
+                       name="tor_answer" 
+                       required 
+                       autocomplete="off" 
+                       class="challenge-input"
+                       aria-label="Enter your answer">
+                
+                <?php $this->renderHiddenFields(); ?>
+                
+                <button type="submit" class="submit-btn">Submit Answer</button>
+            </form>
+            
+            <div class="challenge-info">
+                <p>This math challenge helps prevent automated access through TOR.</p>
+                <p>You have <?php echo self::CHALLENGE_TIMEOUT / 60; ?> minutes to complete this challenge.</p>
+            </div>
+        </div>
+        <?php
+        return ob_get_clean();
+    }
+    
+    private function renderHiddenFields() {
+        foreach ($this->formData as $key => $value) {
+            if ($key !== 'tor_answer') {
+                echo '<input type="hidden" name="' . 
+                     htmlspecialchars($key) . 
+                     '" value="' . 
+                     htmlspecialchars($value) . 
+                     '">';
+            }
+        }
+    }
+}
